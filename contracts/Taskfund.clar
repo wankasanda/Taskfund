@@ -13,12 +13,21 @@
 (define-constant ERR-INSUFFICIENT-STAKE (err u112))
 (define-constant ERR-VOTING-PERIOD-ENDED (err u113))
 (define-constant ERR-VOTING-PERIOD-ACTIVE (err u114))
+(define-constant ERR-ALREADY-RATED (err u115))
+(define-constant ERR-INVALID-RATING (err u116))
+(define-constant ERR-TASK-NOT-COMPLETED (err u117))
+(define-constant ERR-CANNOT-RATE-SELF (err u118))
+(define-constant ERR-RATING-PERIOD-EXPIRED (err u119))
 
 (define-data-var dao-fee uint u50)
 (define-data-var dao-address principal 'SP000000000000000000002Q6VF78)
 (define-data-var arbitrator-stake-amount uint u1000000)
 (define-data-var dispute-voting-period uint u144)
 (define-data-var dispute-nonce uint u0)
+(define-data-var rating-window uint u1008)
+(define-data-var rating-nonce uint u0)
+(define-data-var min-rating uint u1)
+(define-data-var max-rating uint u5)
 
 (define-map tasks 
     { task-id: uint }
@@ -91,6 +100,68 @@
         arbitrator-1: principal,
         arbitrator-2: principal,
         arbitrator-3: principal
+    }
+)
+
+(define-map user-profiles
+    { user: principal }
+    {
+        total-tasks-completed: uint,
+        total-tasks-created: uint,
+        total-earnings: uint,
+        total-spent: uint,
+        average-rating: uint,
+        total-ratings-received: uint,
+        total-ratings-given: uint,
+        reputation-score: uint,
+        last-active: uint,
+        profile-created: uint
+    }
+)
+
+(define-map task-ratings
+    { task-id: uint }
+    {
+        client-rating: uint,
+        freelancer-rating: uint,
+        client-review: (string-ascii 200),
+        freelancer-review: (string-ascii 200),
+        client-rated: bool,
+        freelancer-rated: bool,
+        rating-deadline: uint,
+        completed-at: uint
+    }
+)
+
+(define-map rating-history
+    { rating-id: uint }
+    {
+        task-id: uint,
+        rater: principal,
+        ratee: principal,
+        rating: uint,
+        review: (string-ascii 200),
+        rating-type: (string-ascii 10),
+        created-at: uint
+    }
+)
+
+(define-map performance-metrics
+    { user: principal, metric-type: (string-ascii 20) }
+    {
+        value: uint,
+        count: uint,
+        last-updated: uint
+    }
+)
+
+(define-map reputation-rewards
+    { user: principal }
+    {
+        current-tier: (string-ascii 20),
+        bonus-rate: uint,
+        total-rewards: uint,
+        tier-updated: uint
     }
 )
 
@@ -380,3 +451,310 @@
         false
     )
 )
+
+(define-public (initialize-user-profile)
+    (let
+        ((existing-profile (map-get? user-profiles { user: tx-sender })))
+        (if (is-none existing-profile)
+            (begin
+                (map-set user-profiles
+                    { user: tx-sender }
+                    {
+                        total-tasks-completed: u0,
+                        total-tasks-created: u0,
+                        total-earnings: u0,
+                        total-spent: u0,
+                        average-rating: u0,
+                        total-ratings-received: u0,
+                        total-ratings-given: u0,
+                        reputation-score: u100,
+                        last-active: stacks-block-height,
+                        profile-created: stacks-block-height
+                    }
+                )
+                (map-set reputation-rewards
+                    { user: tx-sender }
+                    {
+                        current-tier: "bronze",
+                        bonus-rate: u0,
+                        total-rewards: u0,
+                        tier-updated: stacks-block-height
+                    }
+                )
+                (ok true)
+            )
+            (ok false)
+        )
+    )
+)
+
+(define-public (submit-task-rating (task-id uint) (rating uint) (review (string-ascii 200)))
+    (let
+        (
+            (task (unwrap! (map-get? tasks { task-id: task-id }) ERR-TASK-NOT-FOUND))
+            (task-rating-data (default-to 
+                {
+                    client-rating: u0,
+                    freelancer-rating: u0,
+                    client-review: "",
+                    freelancer-review: "",
+                    client-rated: false,
+                    freelancer-rated: false,
+                    rating-deadline: (+ stacks-block-height (var-get rating-window)),
+                    completed-at: stacks-block-height
+                }
+                (map-get? task-ratings { task-id: task-id })
+            ))
+            (rating-id (var-get rating-nonce))
+        )
+        (asserts! (is-eq (get status task) "completed") ERR-TASK-NOT-COMPLETED)
+        (asserts! (>= rating (var-get min-rating)) ERR-INVALID-RATING)
+        (asserts! (<= rating (var-get max-rating)) ERR-INVALID-RATING)
+        (asserts! (<= stacks-block-height (get rating-deadline task-rating-data)) ERR-RATING-PERIOD-EXPIRED)
+        (asserts! (or (is-eq tx-sender (get client task)) (is-eq tx-sender (get freelancer task))) ERR-NOT-AUTHORIZED)
+        
+        (if (is-eq tx-sender (get client task))
+            (begin
+                (asserts! (not (get client-rated task-rating-data)) ERR-ALREADY-RATED)
+                (map-set task-ratings
+                    { task-id: task-id }
+                    (merge task-rating-data {
+                        client-rating: rating,
+                        client-review: review,
+                        client-rated: true
+                    })
+                )
+                (map-set rating-history
+                    { rating-id: rating-id }
+                    {
+                        task-id: task-id,
+                        rater: tx-sender,
+                        ratee: (get freelancer task),
+                        rating: rating,
+                        review: review,
+                        rating-type: "client",
+                        created-at: stacks-block-height
+                    }
+                )
+                (unwrap-panic (update-user-rating (get freelancer task) rating))
+            )
+            (begin
+                (asserts! (not (get freelancer-rated task-rating-data)) ERR-ALREADY-RATED)
+                (map-set task-ratings
+                    { task-id: task-id }
+                    (merge task-rating-data {
+                        freelancer-rating: rating,
+                        freelancer-review: review,
+                        freelancer-rated: true
+                    })
+                )
+                (map-set rating-history
+                    { rating-id: rating-id }
+                    {
+                        task-id: task-id,
+                        rater: tx-sender,
+                        ratee: (get client task),
+                        rating: rating,
+                        review: review,
+                        rating-type: "freelancer",
+                        created-at: stacks-block-height
+                    }
+                )
+                (unwrap-panic (update-user-rating (get client task) rating))
+            )
+        )
+        (var-set rating-nonce (+ rating-id u1))
+        (unwrap-panic (update-user-profile-activity tx-sender))
+        (ok rating-id)
+    )
+)
+
+(define-private (update-user-rating (user principal) (new-rating uint))
+    (let
+        (
+            (profile (default-to 
+                {
+                    total-tasks-completed: u0,
+                    total-tasks-created: u0,
+                    total-earnings: u0,
+                    total-spent: u0,
+                    average-rating: u0,
+                    total-ratings-received: u0,
+                    total-ratings-given: u0,
+                    reputation-score: u100,
+                    last-active: stacks-block-height,
+                    profile-created: stacks-block-height
+                }
+                (map-get? user-profiles { user: user })
+            ))
+            (total-ratings (+ (get total-ratings-received profile) u1))
+            (total-rating-points (+ (* (get average-rating profile) (get total-ratings-received profile)) new-rating))
+            (new-average (/ total-rating-points total-ratings))
+            (reputation-adjustment (if (> new-rating u3) u10 u0))
+            (new-reputation (+ (get reputation-score profile) reputation-adjustment))
+        )
+        (map-set user-profiles
+            { user: user }
+            (merge profile {
+                average-rating: new-average,
+                total-ratings-received: total-ratings,
+                reputation-score: new-reputation,
+                last-active: stacks-block-height
+            })
+        )
+        (let ((tier-result (update-reputation-tier user new-reputation)))
+            (ok true)
+        )
+    )
+)
+
+(define-private (update-user-profile-activity (user principal))
+    (let
+        (
+            (profile (unwrap! (map-get? user-profiles { user: user }) ERR-NOT-AUTHORIZED))
+        )
+        (map-set user-profiles
+            { user: user }
+            (merge profile {
+                total-ratings-given: (+ (get total-ratings-given profile) u1),
+                last-active: stacks-block-height
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-private (update-reputation-tier (user principal) (reputation uint))
+    (let
+        (
+            (current-rewards (default-to 
+                {
+                    current-tier: "bronze",
+                    bonus-rate: u0,
+                    total-rewards: u0,
+                    tier-updated: stacks-block-height
+                }
+                (map-get? reputation-rewards { user: user })
+            ))
+            (new-tier (if (>= reputation u1000) "platinum"
+                        (if (>= reputation u500) "gold"
+                          (if (>= reputation u200) "silver" "bronze"))))
+            (new-bonus-rate (if (is-eq new-tier "platinum") u20
+                              (if (is-eq new-tier "gold") u15
+                                (if (is-eq new-tier "silver") u10 u5))))
+        )
+        (map-set reputation-rewards
+            { user: user }
+            (merge current-rewards {
+                current-tier: new-tier,
+                bonus-rate: new-bonus-rate,
+                tier-updated: stacks-block-height
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (update-performance-metric (user principal) (metric-type (string-ascii 20)) (value uint))
+    (let
+        (
+            (current-metric (default-to 
+                {
+                    value: u0,
+                    count: u0,
+                    last-updated: stacks-block-height
+                }
+                (map-get? performance-metrics { user: user, metric-type: metric-type })
+            ))
+        )
+        (map-set performance-metrics
+            { user: user, metric-type: metric-type }
+            {
+                value: (+ (get value current-metric) value),
+                count: (+ (get count current-metric) u1),
+                last-updated: stacks-block-height
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (calculate-reputation-bonus (user principal) (base-amount uint))
+    (let
+        (
+            (rewards (default-to 
+                {
+                    current-tier: "bronze",
+                    bonus-rate: u0,
+                    total-rewards: u0,
+                    tier-updated: stacks-block-height
+                }
+                (map-get? reputation-rewards { user: user })
+            ))
+            (bonus-amount (/ (* base-amount (get bonus-rate rewards)) u100))
+        )
+        (map-set reputation-rewards
+            { user: user }
+            (merge rewards { total-rewards: (+ (get total-rewards rewards) bonus-amount) })
+        )
+        (ok bonus-amount)
+    )
+)
+
+(define-read-only (get-user-profile (user principal))
+    (map-get? user-profiles { user: user })
+)
+
+(define-read-only (get-task-rating (task-id uint))
+    (map-get? task-ratings { task-id: task-id })
+)
+
+(define-read-only (get-rating-details (rating-id uint))
+    (map-get? rating-history { rating-id: rating-id })
+)
+
+(define-read-only (get-performance-metric (user principal) (metric-type (string-ascii 20)))
+    (map-get? performance-metrics { user: user, metric-type: metric-type })
+)
+
+(define-read-only (get-reputation-rewards (user principal))
+    (map-get? reputation-rewards { user: user })
+)
+
+(define-read-only (calculate-trust-score (user principal))
+    (let
+        (
+            (profile (map-get? user-profiles { user: user }))
+        )
+        (match profile
+            user-data 
+                (let
+                    (
+                        (rating-factor (if (> (get total-ratings-received user-data) u0) 
+                                        (* (get average-rating user-data) u20) u0))
+                        (activity-factor (if (> (* (get total-tasks-completed user-data) u5) u100) u100 (* (get total-tasks-completed user-data) u5)))
+                        (reputation-factor (/ (get reputation-score user-data) u10))
+                    )
+                    (some (+ rating-factor (+ activity-factor reputation-factor)))
+                )
+            none
+        )
+    )
+)
+
+(define-read-only (get-user-reputation-summary (user principal))
+    (let
+        (
+            (profile (map-get? user-profiles { user: user }))
+            (rewards (map-get? reputation-rewards { user: user }))
+            (trust-score (calculate-trust-score user))
+        )
+        {
+            profile: profile,
+            rewards: rewards,
+            trust-score: trust-score
+        }
+    )
+)
+
+
